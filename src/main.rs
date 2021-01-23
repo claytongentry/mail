@@ -4,7 +4,7 @@ use futures::stream::{self, StreamExt};
 use std::io::ErrorKind;
 use std::string::String;
 
-async fn write(mut tcpstream: &TcpStream, messages: &[&str; 2]) -> std::io::Result<usize> {
+async fn write(mut tcpstream: &TcpStream, messages: &[&str]) -> std::io::Result<usize> {
     stream::iter(messages)
         .fold(
             Ok(0),
@@ -56,8 +56,6 @@ async fn handle_client(mut stream: TcpStream) {
                 _other => panic!("Error!, {:?}", err),
             },
         };
-
-        println!("{:?}", result);
 
         stream.flush().await.unwrap();
     }
