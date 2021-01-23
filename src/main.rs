@@ -1,8 +1,36 @@
 use async_std::io::prelude::*;
 use async_std::net::{TcpListener, TcpStream};
-use futures::stream::StreamExt;
+use futures::stream::{self, StreamExt};
 use std::io::ErrorKind;
 use std::string::String;
+
+async fn write(mut tcpstream: &TcpStream, messages: &[&str; 2]) -> std::io::Result<usize> {
+    stream::iter(messages)
+        .fold(
+            Ok(0),
+            |acc: std::result::Result<usize, std::io::Error>, msg| async move {
+                match acc {
+                    Err(err) => Err(err),
+                    Ok(bytes) => {
+                        let result = tcpstream.write(msg.as_bytes()).await;
+                        match result {
+                            Err(err) => Err(err),
+                            Ok(new_bytes) => Ok(bytes + new_bytes),
+                        }
+                    }
+                }
+            },
+        )
+        .await
+}
+
+async fn capability(stream: &TcpStream) -> std::io::Result<usize> {
+    write(
+        stream,
+        &["* CAPABILITY IMAP4rev1\n", "abcd OK CAPABILITY completed\n"],
+    )
+    .await
+}
 
 async fn handle_client(mut stream: TcpStream) {
     loop {
@@ -11,25 +39,25 @@ async fn handle_client(mut stream: TcpStream) {
 
         let command = String::from_utf8(buffer.to_vec()).unwrap();
         let command = command.trim_matches(char::from(0));
+        let command = command.trim_matches(char::from(10));
 
-        match command {
-            "CAPABILITY\n" => {
-                println!("Got capability! {:?}", command);
-            }
+        let result = match command {
+            "CAPABILITY" => capability(&stream).await,
             _other => {
                 println!("Huh? {}", command);
+                Ok(0)
             }
         };
 
-        let response = "ack\n";
-        let result = stream.write(response.as_bytes()).await;
         match result {
             Ok(val) => val,
             Err(err) => match err.kind() {
                 ErrorKind::BrokenPipe => break,
-                _other => panic!("Error writing to TCP connection: {:?}", err),
+                _other => panic!("Error!, {:?}", err),
             },
         };
+
+        println!("{:?}", result);
 
         stream.flush().await.unwrap();
     }
@@ -46,9 +74,9 @@ async fn main() {
     // accept connections concurrently
     listener
         .incoming()
-        .for_each_concurrent(/* limit */ None, |tcpstream| async move {
-            let tcpstream = tcpstream.unwrap();
-            handle_client(tcpstream).await;
+        .for_each_concurrent(/* limit */ None, |stream| async move {
+            let stream = stream.unwrap();
+            handle_client(stream).await;
         })
         .await
 }
