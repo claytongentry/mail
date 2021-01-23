@@ -18,6 +18,11 @@ async fn write(mut tcpstream: &TcpStream, messages: &[&str]) -> std::io::Result<
         .await
 }
 
+async fn bad(stream: &TcpStream, message: &str, tag: &str) -> std::io::Result<usize> {
+    let response = tag.to_string() + &(" BAD ".to_string()) + &message.to_string();
+    write(stream, &[&response]).await
+}
+
 async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     write(
         stream,
@@ -35,7 +40,7 @@ fn parse_client_command(command: &str) -> std::io::Result<(&str, &str)> {
     if v.len() < 2 {
         let error = Error::new(
             ErrorKind::InvalidInput,
-            "Client commands should have at least an identifier and a valid IMAPrev1 command.",
+            "Client commands should have at least an identifier and a valid IMAPrev1 command\n",
         );
         return Err(error);
     }
@@ -47,7 +52,7 @@ async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io:
     match command {
         "CAPABILITY" => capability(stream, id).await,
         _other => {
-            let message = command.to_string() + " is not a valid command.";
+            let message = command.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))
         }
     }
@@ -62,18 +67,16 @@ async fn handle_client(mut stream: TcpStream) {
         let command = command.trim_matches(char::from(0));
         let command = command.trim_matches(char::from(10));
 
-        match parse_client_command(command) {
-            Ok((id, command)) => match handle_command(command, id, &stream).await {
-                Ok(val) => val,
-                Err(err) => {
-                    match err.kind() {
-                        ErrorKind::BrokenPipe => break,
-                        ErrorKind::InvalidInput => break,
-                        _other => panic!("Error!, {:?}", err),
-                    };
-                }
+        let _result = match parse_client_command(command) {
+            Ok((tag, command)) => match handle_command(command, tag, &stream).await {
+                Ok(val) => Ok(val),
+                Err(err) => match err.kind() {
+                    ErrorKind::BrokenPipe => break,
+                    ErrorKind::InvalidInput => bad(&stream, &err.to_string(), tag).await,
+                    _other => panic!("Error!, {:?}", err),
+                },
             },
-            Err(_) => break,
+            Err(err) => bad(&stream, &err.to_string(), "*").await,
         };
 
         stream.flush().await.unwrap();
