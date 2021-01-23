@@ -1,0 +1,1 @@
+sqlite for persistence? https://github.com/diesel-rs/diesel
