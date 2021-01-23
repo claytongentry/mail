@@ -4,6 +4,10 @@ use futures::stream::{self, StreamExt};
 use std::io::{Error, ErrorKind};
 use std::string::String;
 
+struct Connection {
+    stream: TcpStream,
+}
+
 async fn write(mut tcpstream: &TcpStream, messages: &[&str]) -> std::io::Result<usize> {
     stream::iter(messages)
         .fold(Ok(0), |acc, msg| async move {
@@ -96,7 +100,9 @@ async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io:
     }
 }
 
-async fn handle_client(mut stream: TcpStream) {
+async fn handle_connection(connection: Connection) {
+    let Connection { mut stream } = connection;
+
     loop {
         let mut buffer = [0; 1024];
         match stream.read(&mut buffer).await {
@@ -119,9 +125,7 @@ async fn handle_client(mut stream: TcpStream) {
                     },
                 };
 
-                /**
-                 * Can use this space to close connections as needed
-                 */
+                // Can use this space to close connections as needed
                 match command {
                     "LOGOUT" => break,
                     other => other,
@@ -149,7 +153,8 @@ async fn main() {
         .incoming()
         .for_each_concurrent(/* limit */ None, |stream| async move {
             let stream = stream.unwrap();
-            handle_client(stream).await;
+            let connection = Connection { stream };
+            handle_connection(connection).await;
         })
         .await
 }
