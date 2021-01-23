@@ -1,35 +1,56 @@
 use async_std::io::prelude::*;
 use async_std::net::{TcpListener, TcpStream};
 use futures::stream::{self, StreamExt};
-use std::io::ErrorKind;
+use std::io::{Error, ErrorKind};
 use std::string::String;
 
 async fn write(mut tcpstream: &TcpStream, messages: &[&str]) -> std::io::Result<usize> {
     stream::iter(messages)
-        .fold(
-            Ok(0),
-            |acc: std::result::Result<usize, std::io::Error>, msg| async move {
-                match acc {
+        .fold(Ok(0), |acc, msg| async move {
+            match acc {
+                Err(err) => Err(err),
+                Ok(bytes) => match tcpstream.write(msg.as_bytes()).await {
                     Err(err) => Err(err),
-                    Ok(bytes) => {
-                        let result = tcpstream.write(msg.as_bytes()).await;
-                        match result {
-                            Err(err) => Err(err),
-                            Ok(new_bytes) => Ok(bytes + new_bytes),
-                        }
-                    }
-                }
-            },
-        )
+                    Ok(new_bytes) => Ok(bytes + new_bytes),
+                },
+            }
+        })
         .await
 }
 
-async fn capability(stream: &TcpStream) -> std::io::Result<usize> {
+async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     write(
         stream,
-        &["* CAPABILITY IMAP4rev1\n", "abcd OK CAPABILITY completed\n"],
+        &[
+            "* CAPABILITY IMAP4rev1\n",
+            &(id.to_string() + " OK CAPABILITY completed\n"),
+        ],
     )
     .await
+}
+
+fn parse_client_command(command: &str) -> std::io::Result<(&str, &str)> {
+    let v: Vec<&str> = command.splitn(2, ' ').collect();
+
+    if v.len() < 2 {
+        let error = Error::new(
+            ErrorKind::InvalidInput,
+            "Client commands should have at least an identifier and a valid IMAPrev1 command.",
+        );
+        return Err(error);
+    }
+
+    Ok((v[0], v[1]))
+}
+
+async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io::Result<usize> {
+    match command {
+        "CAPABILITY" => capability(stream, id).await,
+        _other => {
+            let message = command.to_string() + " is not a valid command.";
+            Err(Error::new(ErrorKind::InvalidInput, message))
+        }
+    }
 }
 
 async fn handle_client(mut stream: TcpStream) {
@@ -41,20 +62,18 @@ async fn handle_client(mut stream: TcpStream) {
         let command = command.trim_matches(char::from(0));
         let command = command.trim_matches(char::from(10));
 
-        let result = match command {
-            "CAPABILITY" => capability(&stream).await,
-            _other => {
-                println!("Huh? {}", command);
-                Ok(0)
-            }
-        };
-
-        match result {
-            Ok(val) => val,
-            Err(err) => match err.kind() {
-                ErrorKind::BrokenPipe => break,
-                _other => panic!("Error!, {:?}", err),
+        match parse_client_command(command) {
+            Ok((id, command)) => match handle_command(command, id, &stream).await {
+                Ok(val) => val,
+                Err(err) => {
+                    match err.kind() {
+                        ErrorKind::BrokenPipe => break,
+                        ErrorKind::InvalidInput => break,
+                        _other => panic!("Error!, {:?}", err),
+                    };
+                }
             },
+            Err(_) => break,
         };
 
         stream.flush().await.unwrap();
@@ -63,6 +82,8 @@ async fn handle_client(mut stream: TcpStream) {
 
 #[async_std::main]
 async fn main() {
+    println!("IMAPrev1 listening on 1143...");
+
     /*
      * IMAPrev1 servers listen on port 143
      * https://tools.ietf.org/html/rfc2060#section-2.1
