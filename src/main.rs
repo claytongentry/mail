@@ -23,6 +23,12 @@ async fn bad(stream: &TcpStream, message: &str, tag: &str) -> std::io::Result<us
     write(stream, &[&response]).await
 }
 
+/**
+ ****************************************************************
+ * Begin response implementations
+ ****************************************************************
+ */
+
 async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     write(
         stream,
@@ -33,6 +39,25 @@ async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     )
     .await
 }
+
+/**
+* TODO:
+* Since any command can return a status update as untagged data, the
+     NOOP command can be used as a periodic poll for new messages or
+     message status updates during a period of inactivity.  The NOOP
+     command can also be used to reset any inactivity autologout timer
+     on the server.
+* https://tools.ietf.org/html/rfc2060#section-6.1.2
+*/
+async fn noop(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
+    write(stream, &[&(id.to_string() + " OK NOOP completed\n")]).await
+}
+
+/**
+ ****************************************************************
+ * End response implementations
+ ****************************************************************
+ */
 
 fn parse_client_command(command: &str) -> std::io::Result<(&str, &str)> {
     let v: Vec<&str> = command.splitn(2, ' ').collect();
@@ -51,6 +76,7 @@ fn parse_client_command(command: &str) -> std::io::Result<(&str, &str)> {
 async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io::Result<usize> {
     match command {
         "CAPABILITY" => capability(stream, id).await,
+        "NOOP" => noop(stream, id).await,
         _other => {
             let message = command.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))
@@ -63,7 +89,7 @@ async fn handle_client(mut stream: TcpStream) {
         let mut buffer = [0; 1024];
         match stream.read(&mut buffer).await {
             Ok(val) => val,
-            Err(_) => break
+            Err(_) => break,
         };
 
         let command = String::from_utf8(buffer.to_vec()).unwrap();
