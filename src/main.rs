@@ -1,18 +1,29 @@
 use async_std::io::prelude::*;
 use async_std::net::{TcpListener, TcpStream};
 use futures::stream::StreamExt;
+use std::io::ErrorKind;
 use std::str;
 
 async fn handle_client(mut stream: TcpStream) {
-    let mut buffer = [0; 1024];
-    stream.read(&mut buffer).await.unwrap();
+    loop {
+        let mut buffer = [0; 1024];
+        stream.read(&mut buffer).await.unwrap();
 
-    let string_value = str::from_utf8(&mut buffer).unwrap();
-    println!("Server got bytes: {}", string_value);
+        let string_value = str::from_utf8(&mut buffer).unwrap();
+        println!("Server got bytes: {}", string_value);
 
-    let response = "ack\n";
-    stream.write(response.as_bytes()).await.unwrap();
-    stream.flush().await.unwrap();
+        let response = "ack\n";
+        let result = stream.write(response.as_bytes()).await;
+        match result {
+            Ok(val) => val,
+            Err(err) => match err.kind() {
+                ErrorKind::BrokenPipe => break,
+                _other => panic!("Error writing to TCP connection: {:?}", err),
+            },
+        };
+
+        stream.flush().await.unwrap();
+    }
 }
 
 #[async_std::main]
