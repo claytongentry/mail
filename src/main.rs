@@ -61,7 +61,10 @@ async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io:
 async fn handle_client(mut stream: TcpStream) {
     loop {
         let mut buffer = [0; 1024];
-        stream.read(&mut buffer).await.unwrap();
+        match stream.read(&mut buffer).await {
+            Ok(val) => val,
+            Err(_) => break
+        };
 
         let command = String::from_utf8(buffer.to_vec()).unwrap();
         let command = command.trim_matches(char::from(0));
