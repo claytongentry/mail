@@ -40,13 +40,24 @@ async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     .await
 }
 
+async fn logout(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
+    write(
+        stream,
+        &[
+            "* BYE IMAPrev1 Server logging out\n",
+            &(id.to_string() + " OK LOGOUT completed\n"),
+        ],
+    )
+    .await
+}
+
 /**
 * TODO:
 * Since any command can return a status update as untagged data, the
-     NOOP command can be used as a periodic poll for new messages or
-     message status updates during a period of inactivity.  The NOOP
-     command can also be used to reset any inactivity autologout timer
-     on the server.
+    NOOP command can be used as a periodic poll for new messages or
+    message status updates during a period of inactivity.  The NOOP
+    command can also be used to reset any inactivity autologout timer
+    on the server.
 * https://tools.ietf.org/html/rfc2060#section-6.1.2
 */
 async fn noop(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
@@ -76,6 +87,7 @@ fn parse_client_command(command: &str) -> std::io::Result<(&str, &str)> {
 async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io::Result<usize> {
     match command {
         "CAPABILITY" => capability(stream, id).await,
+        "LOGOUT" => logout(stream, id).await,
         "NOOP" => noop(stream, id).await,
         _other => {
             let message = command.to_string() + " is not a valid command.\n";
@@ -96,19 +108,29 @@ async fn handle_client(mut stream: TcpStream) {
         let command = command.trim_matches(char::from(0));
         let command = command.trim_matches(char::from(10));
 
-        let _result = match parse_client_command(command) {
-            Ok((tag, command)) => match handle_command(command, tag, &stream).await {
-                Ok(val) => Ok(val),
-                Err(err) => match err.kind() {
-                    ErrorKind::BrokenPipe => break,
-                    ErrorKind::InvalidInput => bad(&stream, &err.to_string(), tag).await,
-                    _other => panic!("Error!, {:?}", err),
-                },
-            },
+        let _ = match parse_client_command(command) {
+            Ok((tag, command)) => {
+                let result = match handle_command(command, tag, &stream).await {
+                    Ok(val) => Ok(val),
+                    Err(err) => match err.kind() {
+                        ErrorKind::BrokenPipe => break,
+                        ErrorKind::InvalidInput => bad(&stream, &err.to_string(), tag).await,
+                        _other => panic!("Error!, {:?}", err),
+                    },
+                };
+
+                /**
+                 * Can use this space to close connections as needed
+                 */
+                match command {
+                    "LOGOUT" => break,
+                    other => other,
+                };
+
+                result
+            }
             Err(err) => bad(&stream, &err.to_string(), "*").await,
         };
-
-        stream.flush().await.unwrap();
     }
 }
 
