@@ -4,11 +4,17 @@ use futures::stream::{self, StreamExt};
 use std::io::{Error, ErrorKind};
 use std::string::String;
 
+enum ConnectionState {
+    NONAUTHENTICATED,
+}
+
 struct Connection {
+    state: ConnectionState,
     stream: TcpStream,
 }
 
-async fn write(mut tcpstream: &TcpStream, messages: &[&str]) -> std::io::Result<usize> {
+async fn write(connection: &Connection, messages: &[&str]) -> std::io::Result<usize> {
+    let mut tcpstream = &connection.stream;
     stream::iter(messages)
         .fold(Ok(0), |acc, msg| async move {
             match acc {
@@ -22,9 +28,9 @@ async fn write(mut tcpstream: &TcpStream, messages: &[&str]) -> std::io::Result<
         .await
 }
 
-async fn bad(stream: &TcpStream, message: &str, tag: &str) -> std::io::Result<usize> {
+async fn bad(connection: &Connection, message: &str, tag: &str) -> std::io::Result<usize> {
     let response = tag.to_string() + &(" BAD ".to_string()) + &message.to_string();
-    write(stream, &[&response]).await
+    write(connection, &[&response]).await
 }
 
 /**
@@ -33,9 +39,9 @@ async fn bad(stream: &TcpStream, message: &str, tag: &str) -> std::io::Result<us
  ****************************************************************
  */
 
-async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
+async fn capability(connection: &Connection, id: &str) -> std::io::Result<usize> {
     write(
-        stream,
+        connection,
         &[
             "* CAPABILITY IMAP4rev1\n",
             &(id.to_string() + " OK CAPABILITY completed\n"),
@@ -44,9 +50,9 @@ async fn capability(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     .await
 }
 
-async fn logout(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
+async fn logout(connection: &Connection, id: &str) -> std::io::Result<usize> {
     write(
-        stream,
+        connection,
         &[
             "* BYE IMAPrev1 Server logging out\n",
             &(id.to_string() + " OK LOGOUT completed\n"),
@@ -64,8 +70,8 @@ async fn logout(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
     on the server.
 * https://tools.ietf.org/html/rfc2060#section-6.1.2
 */
-async fn noop(stream: &TcpStream, id: &str) -> std::io::Result<usize> {
-    write(stream, &[&(id.to_string() + " OK NOOP completed\n")]).await
+async fn noop(connection: &Connection, id: &str) -> std::io::Result<usize> {
+    write(connection, &[&(id.to_string() + " OK NOOP completed\n")]).await
 }
 
 /**
@@ -88,11 +94,15 @@ fn parse_client_command(command: &str) -> std::io::Result<(&str, &str)> {
     Ok((v[0], v[1]))
 }
 
-async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io::Result<usize> {
+async fn handle_command(
+    command: &str,
+    id: &str,
+    connection: &Connection,
+) -> std::io::Result<usize> {
     match command {
-        "CAPABILITY" => capability(stream, id).await,
-        "LOGOUT" => logout(stream, id).await,
-        "NOOP" => noop(stream, id).await,
+        "CAPABILITY" => capability(&connection, id).await,
+        "LOGOUT" => logout(&connection, id).await,
+        "NOOP" => noop(&connection, id).await,
         _other => {
             let message = command.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))
@@ -101,7 +111,7 @@ async fn handle_command(command: &str, id: &str, stream: &TcpStream) -> std::io:
 }
 
 async fn handle_connection(connection: Connection) {
-    let Connection { mut stream } = connection;
+    let mut stream = &connection.stream;
 
     loop {
         let mut buffer = [0; 1024];
@@ -116,11 +126,11 @@ async fn handle_connection(connection: Connection) {
 
         let _ = match parse_client_command(command) {
             Ok((tag, command)) => {
-                let result = match handle_command(command, tag, &stream).await {
+                let result = match handle_command(command, tag, &connection).await {
                     Ok(val) => Ok(val),
                     Err(err) => match err.kind() {
                         ErrorKind::BrokenPipe => break,
-                        ErrorKind::InvalidInput => bad(&stream, &err.to_string(), tag).await,
+                        ErrorKind::InvalidInput => bad(&connection, &err.to_string(), tag).await,
                         _other => panic!("Error!, {:?}", err),
                     },
                 };
@@ -133,7 +143,7 @@ async fn handle_connection(connection: Connection) {
 
                 result
             }
-            Err(err) => bad(&stream, &err.to_string(), "*").await,
+            Err(err) => bad(&connection, &err.to_string(), "*").await,
         };
     }
 }
@@ -152,8 +162,9 @@ async fn main() {
     listener
         .incoming()
         .for_each_concurrent(/* limit */ None, |stream| async move {
+            let state = ConnectionState::NONAUTHENTICATED;
             let stream = stream.unwrap();
-            let connection = Connection { stream };
+            let connection = Connection { state, stream };
             handle_connection(connection).await;
         })
         .await
