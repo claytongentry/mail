@@ -4,7 +4,8 @@ use futures::stream::{self, StreamExt};
 use std::io::{Error, ErrorKind};
 
 enum ConnectionState {
-    NONAUTHENTICATED,
+    NOTAUTHENTICATED,
+    AUTHENTICATED,
 }
 
 pub struct Connection {
@@ -20,7 +21,7 @@ async fn read(connection: &Connection) -> [u8; 1024] {
 }
 
 pub fn new(stream: TcpStream) -> Connection {
-    let state = ConnectionState::NONAUTHENTICATED;
+    let state = ConnectionState::NOTAUTHENTICATED;
     Connection { state, stream }
 }
 
@@ -67,4 +68,12 @@ pub async fn read_command(
     }
 
     return Ok((command, tag, args));
+}
+
+pub fn set_authenticated_state(connection: &mut Connection) {
+    set_state(connection, ConnectionState::AUTHENTICATED);
+}
+
+fn set_state(connection: &mut Connection, state: ConnectionState) {
+    connection.state = state;
 }

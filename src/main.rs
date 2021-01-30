@@ -20,7 +20,7 @@ async fn bad(connection: &Connection, message: &str, tag: &String) -> std::io::R
  * https://tools.ietf.org/html/rfc2060#section-6.2.1
  */
 async fn authenticate(
-    connection: &Connection,
+    connection: &mut Connection,
     id: &String,
     args: Vec<String>,
 ) -> std::io::Result<usize> {
@@ -34,6 +34,7 @@ async fn authenticate(
     match mechanism.as_str() {
         "XOAUTH2" => match oauth2::authenticate(token) {
             Ok(_claims) => {
+                connection::set_authenticated_state(connection);
                 connection::write(connection, &["OK SASL authentication successful\n"]).await
             }
             _err => {
@@ -99,10 +100,10 @@ async fn handle_command(
     command: &String,
     id: &String,
     args: Vec<String>,
-    connection: &Connection,
+    connection: &mut Connection,
 ) -> std::io::Result<usize> {
     match command.as_str() {
-        "AUTHENTICATE" => authenticate(&connection, id, args).await,
+        "AUTHENTICATE" => authenticate(connection, id, args).await,
         "CAPABILITY" => capability(&connection, id).await,
         "LOGOUT" => logout(&connection, id).await,
         "NOOP" => noop(&connection, id).await,
@@ -113,11 +114,11 @@ async fn handle_command(
     }
 }
 
-async fn handle_connection(connection: Connection) {
+async fn handle_connection(connection: &mut Connection) {
     loop {
-        match connection::read_command(&connection).await {
+        match connection::read_command(connection).await {
             Ok((command, tag, args)) => {
-                let _ = match handle_command(&command, &tag, args, &connection).await {
+                let _ = match handle_command(&command, &tag, args, connection).await {
                     Ok(val) => Ok(val),
                     Err(err) => match err.kind() {
                         ErrorKind::BrokenPipe => break,
@@ -156,8 +157,8 @@ async fn main() {
         .incoming()
         .for_each_concurrent(/* limit */ None, |stream| async move {
             let stream = stream.unwrap();
-            let connection = connection::new(stream);
-            handle_connection(connection).await;
+            let mut conn = connection::new(stream);
+            handle_connection(&mut conn).await;
         })
         .await
 }
