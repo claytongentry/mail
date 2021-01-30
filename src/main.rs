@@ -32,13 +32,18 @@ async fn authenticate(
     let token = &args[1];
 
     match mechanism.as_str() {
-        "XOAUTH2" => {
-            if oauth2::authenticate(token) {
-                return connection::write(connection, &["OK Success\n"]).await;
+        "XOAUTH2" => match oauth2::authenticate(token) {
+            Ok(_claims) => {
+                connection::write(connection, &["OK SASL authentication successful\n"]).await
             }
-
-            Err(Error::new(ErrorKind::InvalidData, "Invalid token"))
-        }
+            _err => {
+                connection::write(
+                    connection,
+                    &[&(id.to_string() + " NO Invalid credentials\n")],
+                )
+                .await
+            }
+        },
         _other => {
             connection::write(
                 connection,

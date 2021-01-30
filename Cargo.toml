@@ -8,6 +8,8 @@ edition = "2018"
 
 [dependencies]
 futures = "0.3"
+jsonwebtoken = "7.2.0"
+serde = "1.0.123"
 
 [dependencies.async-std]
 version = "1.6"

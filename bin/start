@@ -1,0 +1,1 @@
+eval $(cat .secrets.dev) cargo run
