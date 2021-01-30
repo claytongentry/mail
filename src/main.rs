@@ -67,7 +67,11 @@ async fn capability(connection: &Connection, id: &String) -> std::io::Result<usi
 }
 
 async fn login(connection: &Connection, id: &String) -> std::io::Result<usize> {
-    connection::write(connection, &[&(id.to_string() + " NO Login is disabled.\n")]).await
+    connection::write(
+        connection,
+        &[&(id.to_string() + " NO Login is disabled.\n")],
+    )
+    .await
 }
 
 async fn logout(connection: &mut Connection, id: &String) -> std::io::Result<usize> {
@@ -95,6 +99,23 @@ async fn noop(connection: &Connection, id: &String) -> std::io::Result<usize> {
     connection::write(connection, &[&(id.to_string() + " OK NOOP completed\n")]).await
 }
 
+async fn select(connection: &Connection, id: &String) -> std::io::Result<usize> {
+    connection::write(
+        connection,
+        &[
+            "* 172 EXISTS\n",
+            "* 1 RECENT\n",
+            "* OK [UNSEEN 12] Message 12 is first unseen\n",
+            "* OK [UIDVALIDITY 3857529045] UIDs valid\n",
+            "* OK [UIDNEXT 4392] Predicted next UID\n",
+            "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\n",
+            "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\n",
+            &(id.to_string() + "OK [READ-WRITE] SELECT completed\n"),
+        ],
+    )
+    .await
+}
+
 /**
  ****************************************************************
  * End response implementations
@@ -113,6 +134,7 @@ async fn handle_command(
         "LOGIN" => login(connection, id).await,
         "LOGOUT" => logout(connection, id).await,
         "NOOP" => noop(connection, id).await,
+        "SELECT" => select(connection, id).await,
         _other => {
             let message = command.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))
