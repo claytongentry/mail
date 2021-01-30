@@ -70,7 +70,8 @@ async fn login(connection: &Connection, id: &String) -> std::io::Result<usize> {
     connection::write(connection, &[&(id.to_string() + " NO Login is disabled.\n")]).await
 }
 
-async fn logout(connection: &Connection, id: &String) -> std::io::Result<usize> {
+async fn logout(connection: &mut Connection, id: &String) -> std::io::Result<usize> {
+    connection::set_logout_state(connection);
     connection::write(
         connection,
         &[
@@ -108,10 +109,10 @@ async fn handle_command(
 ) -> std::io::Result<usize> {
     match command.as_str() {
         "AUTHENTICATE" => authenticate(connection, id, args).await,
-        "CAPABILITY" => capability(&connection, id).await,
+        "CAPABILITY" => capability(connection, id).await,
         "LOGIN" => login(connection, id).await,
-        "LOGOUT" => logout(&connection, id).await,
-        "NOOP" => noop(&connection, id).await,
+        "LOGOUT" => logout(connection, id).await,
+        "NOOP" => noop(connection, id).await,
         _other => {
             let message = command.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))

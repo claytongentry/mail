@@ -6,6 +6,7 @@ use std::io::{Error, ErrorKind};
 enum ConnectionState {
     NOTAUTHENTICATED,
     AUTHENTICATED,
+    LOGOUT,
 }
 
 pub struct Connection {
@@ -72,6 +73,10 @@ pub async fn read_command(
 
 pub fn set_authenticated_state(connection: &mut Connection) {
     set_state(connection, ConnectionState::AUTHENTICATED);
+}
+
+pub fn set_logout_state(connection: &mut Connection) {
+    set_state(connection, ConnectionState::LOGOUT);
 }
 
 fn set_state(connection: &mut Connection, state: ConnectionState) {
