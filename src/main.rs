@@ -59,11 +59,15 @@ async fn capability(connection: &Connection, id: &String) -> std::io::Result<usi
     connection::write(
         connection,
         &[
-            "* CAPABILITY IMAP4rev1 AUTH=XOAUTH2\n",
+            "* CAPABILITY IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED\n",
             &(id.to_string() + " OK CAPABILITY completed\n"),
         ],
     )
     .await
+}
+
+async fn login(connection: &Connection, id: &String) -> std::io::Result<usize> {
+    connection::write(connection, &[&(id.to_string() + " NO Login is disabled.\n")]).await
 }
 
 async fn logout(connection: &Connection, id: &String) -> std::io::Result<usize> {
@@ -105,6 +109,7 @@ async fn handle_command(
     match command.as_str() {
         "AUTHENTICATE" => authenticate(connection, id, args).await,
         "CAPABILITY" => capability(&connection, id).await,
+        "LOGIN" => login(connection, id).await,
         "LOGOUT" => logout(&connection, id).await,
         "NOOP" => noop(&connection, id).await,
         _other => {
