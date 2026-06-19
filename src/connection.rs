@@ -9,10 +9,21 @@ use std::io::{Error, ErrorKind};
 const MAX_COMMAND_LINE_BYTES: usize = 8192;
 const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
 
-enum ConnectionState {
-    NOTAUTHENTICATED,
-    AUTHENTICATED,
-    LOGOUT,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    NotAuthenticated,
+    Authenticated,
+    Logout,
+}
+
+impl ConnectionState {
+    pub fn as_imap_name(self) -> &'static str {
+        match self {
+            ConnectionState::NotAuthenticated => "NOTAUTHENTICATED",
+            ConnectionState::Authenticated => "AUTHENTICATED",
+            ConnectionState::Logout => "LOGOUT",
+        }
+    }
 }
 
 pub struct Connection {
@@ -22,7 +33,7 @@ pub struct Connection {
 }
 
 pub fn new(stream: TcpStream) -> Connection {
-    let state = ConnectionState::NOTAUTHENTICATED;
+    let state = ConnectionState::NotAuthenticated;
     let reader = BufReader::new(stream.clone());
     Connection {
         state,
@@ -131,11 +142,15 @@ async fn read_literal(
 }
 
 pub fn set_authenticated_state(connection: &mut Connection) {
-    set_state(connection, ConnectionState::AUTHENTICATED);
+    set_state(connection, ConnectionState::Authenticated);
 }
 
 pub fn set_logout_state(connection: &mut Connection) {
-    set_state(connection, ConnectionState::LOGOUT);
+    set_state(connection, ConnectionState::Logout);
+}
+
+pub fn state(connection: &Connection) -> ConnectionState {
+    connection.state
 }
 
 fn set_state(connection: &mut Connection, state: ConnectionState) {

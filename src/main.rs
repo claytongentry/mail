@@ -5,12 +5,39 @@ use std::io::{Error, ErrorKind};
 mod connection;
 mod oauth2;
 mod parser;
-use connection::Connection;
+use connection::{Connection, ConnectionState};
 use parser::{Argument, Command};
 
+const GREETING: &str = "* OK IMAP4rev1 Service Ready\r\n";
+
+fn tagged(tag: &str, status: &str, message: &str) -> String {
+    format!(
+        "{} {} {}\r\n",
+        tag,
+        status,
+        message.trim_end_matches(&['\r', '\n'][..])
+    )
+}
+
+fn untagged(message: &str) -> String {
+    format!("* {}\r\n", message.trim_end_matches(&['\r', '\n'][..]))
+}
+
+async fn write_messages(connection: &Connection, messages: Vec<String>) -> std::io::Result<usize> {
+    let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+    connection::write(connection, refs.as_slice()).await
+}
+
+async fn ok(connection: &Connection, tag: &str, message: &str) -> std::io::Result<usize> {
+    write_messages(connection, vec![tagged(tag, "OK", message)]).await
+}
+
+async fn no(connection: &Connection, tag: &str, message: &str) -> std::io::Result<usize> {
+    write_messages(connection, vec![tagged(tag, "NO", message)]).await
+}
+
 async fn bad(connection: &Connection, message: &str, tag: &str) -> std::io::Result<usize> {
-    let response = tag.to_string() + &(" BAD ".to_string()) + &message.to_string();
-    connection::write(connection, &[&response]).await
+    write_messages(connection, vec![tagged(tag, "BAD", message)]).await
 }
 
 /**
@@ -37,52 +64,36 @@ async fn authenticate(
         "XOAUTH2" => match oauth2::authenticate(token) {
             Ok(_claims) => {
                 connection::set_authenticated_state(connection);
-                connection::write(connection, &["OK SASL authentication successful\n"]).await
+                ok(connection, id, "SASL authentication successful").await
             }
-            _err => {
-                connection::write(
-                    connection,
-                    &[&(id.to_string() + " NO Invalid credentials\n")],
-                )
-                .await
-            }
+            _err => no(connection, id, "Invalid credentials").await,
         },
-        _other => {
-            connection::write(
-                connection,
-                &[&(id.to_string() + " NO Unsupported authentication mechanism\n")],
-            )
-            .await
-        }
+        _other => no(connection, id, "Unsupported authentication mechanism").await,
     }
 }
 
 async fn capability(connection: &Connection, id: &str) -> std::io::Result<usize> {
-    connection::write(
+    write_messages(
         connection,
-        &[
-            "* CAPABILITY IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED\n",
-            &(id.to_string() + " OK CAPABILITY completed\n"),
+        vec![
+            untagged("CAPABILITY IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED"),
+            tagged(id, "OK", "CAPABILITY completed"),
         ],
     )
     .await
 }
 
 async fn login(connection: &Connection, id: &str) -> std::io::Result<usize> {
-    connection::write(
-        connection,
-        &[&(id.to_string() + " NO Login is disabled.\n")],
-    )
-    .await
+    no(connection, id, "Login is disabled.").await
 }
 
 async fn logout(connection: &mut Connection, id: &str) -> std::io::Result<usize> {
     connection::set_logout_state(connection);
-    connection::write(
+    write_messages(
         connection,
-        &[
-            "* BYE IMAPrev1 Server logging out\n",
-            &(id.to_string() + " OK LOGOUT completed\n"),
+        vec![
+            untagged("BYE IMAPrev1 Server logging out"),
+            tagged(id, "OK", "LOGOUT completed"),
         ],
     )
     .await
@@ -98,21 +109,21 @@ async fn logout(connection: &mut Connection, id: &str) -> std::io::Result<usize>
 * https://tools.ietf.org/html/rfc2060#section-6.1.2
 */
 async fn noop(connection: &Connection, id: &str) -> std::io::Result<usize> {
-    connection::write(connection, &[&(id.to_string() + " OK NOOP completed\n")]).await
+    ok(connection, id, "NOOP completed").await
 }
 
 async fn select(connection: &Connection, id: &str) -> std::io::Result<usize> {
-    connection::write(
+    write_messages(
         connection,
-        &[
-            "* 172 EXISTS\n",
-            "* 1 RECENT\n",
-            "* OK [UNSEEN 12] Message 12 is first unseen\n",
-            "* OK [UIDVALIDITY 3857529045] UIDs valid\n",
-            "* OK [UIDNEXT 4392] Predicted next UID\n",
-            "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\n",
-            "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\n",
-            &(id.to_string() + "OK [READ-WRITE] SELECT completed\n"),
+        vec![
+            untagged("172 EXISTS"),
+            untagged("1 RECENT"),
+            untagged("OK [UNSEEN 12] Message 12 is first unseen"),
+            untagged("OK [UIDVALIDITY 3857529045] UIDs valid"),
+            untagged("OK [UIDNEXT 4392] Predicted next UID"),
+            untagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)"),
+            untagged("OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited"),
+            tagged(id, "OK", "[READ-WRITE] SELECT completed"),
         ],
     )
     .await
@@ -125,6 +136,19 @@ async fn select(connection: &Connection, id: &str) -> std::io::Result<usize> {
  */
 
 async fn handle_command(command: &Command, connection: &mut Connection) -> std::io::Result<usize> {
+    let state = connection::state(connection);
+
+    if !command_is_valid_for_state(command, state) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "Command {} is not valid in {} state",
+                command.name(),
+                state.as_imap_name()
+            ),
+        ));
+    }
+
     match command {
         Command::Authenticate {
             tag,
@@ -137,13 +161,40 @@ async fn handle_command(command: &Command, connection: &mut Connection) -> std::
         Command::Noop { tag } => noop(connection, tag).await,
         Command::Select { tag, .. } => select(connection, tag).await,
         Command::Unknown { name, .. } => {
-            let message = name.to_string() + " is not a valid command.\n";
+            let message = name.to_string() + " is not a valid command.";
             Err(Error::new(ErrorKind::InvalidInput, message))
         }
     }
 }
 
+fn command_is_valid_for_state(command: &Command, state: ConnectionState) -> bool {
+    match state {
+        ConnectionState::NotAuthenticated => matches!(
+            command,
+            Command::Authenticate { .. }
+                | Command::Capability { .. }
+                | Command::Login { .. }
+                | Command::Logout { .. }
+                | Command::Noop { .. }
+                | Command::Unknown { .. }
+        ),
+        ConnectionState::Authenticated => matches!(
+            command,
+            Command::Capability { .. }
+                | Command::Logout { .. }
+                | Command::Noop { .. }
+                | Command::Select { .. }
+                | Command::Unknown { .. }
+        ),
+        ConnectionState::Logout => false,
+    }
+}
+
 async fn handle_connection(connection: &mut Connection) {
+    if connection::write(connection, &[GREETING]).await.is_err() {
+        return;
+    }
+
     loop {
         match connection::read_command(connection).await {
             Ok(command) => {
@@ -165,6 +216,10 @@ async fn handle_connection(connection: &mut Connection) {
                 };
             }
             Err(err) => {
+                if err.kind() == ErrorKind::BrokenPipe {
+                    break;
+                }
+
                 let tag = "*".to_string();
                 let msg = &err.to_string();
                 let _ = bad(&connection, msg, &tag).await;
@@ -193,4 +248,193 @@ async fn main() {
             handle_connection(&mut conn).await;
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_std::io::prelude::*;
+    use async_std::io::BufReader;
+    use async_std::net::{TcpListener, TcpStream};
+    use async_std::task;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde::Serialize;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[derive(Serialize)]
+    struct TestClaims {
+        exp: u64,
+    }
+
+    async fn connect_to_server() -> (BufReader<TcpStream>, task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = task::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = connection::new(stream);
+            handle_connection(&mut connection).await;
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+
+        (BufReader::new(client), server)
+    }
+
+    async fn read_line(reader: &mut BufReader<TcpStream>) -> String {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        line
+    }
+
+    async fn write_line(reader: &mut BufReader<TcpStream>, line: &str) {
+        reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    }
+
+    async fn logout(reader: &mut BufReader<TcpStream>, server: task::JoinHandle<()>) {
+        write_line(reader, "ZZ LOGOUT\r\n").await;
+        assert_eq!(
+            "* BYE IMAPrev1 Server logging out\r\n",
+            read_line(reader).await
+        );
+        assert_eq!("ZZ OK LOGOUT completed\r\n", read_line(reader).await);
+        server.await;
+    }
+
+    fn test_token(secret: &str) -> String {
+        let exp = (SystemTime::now() + Duration::new(60 * 60, 0))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        encode(
+            &Header::default(),
+            &TestClaims { exp },
+            &EncodingKey::from_secret(secret.as_ref()),
+        )
+        .unwrap()
+    }
+
+    #[async_std::test]
+    async fn connection_starts_with_imap_greeting() {
+        let (mut reader, server) = connect_to_server().await;
+
+        assert_eq!(
+            "* OK IMAP4rev1 Service Ready\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn select_before_authentication_is_rejected() {
+        let (mut reader, server) = connect_to_server().await;
+
+        assert_eq!(
+            "* OK IMAP4rev1 Service Ready\r\n",
+            read_line(&mut reader).await
+        );
+        write_line(&mut reader, "A1 SELECT INBOX\r\n").await;
+
+        assert_eq!(
+            "A1 BAD Command SELECT is not valid in NOTAUTHENTICATED state\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_success_is_tagged_and_crlf_terminated() {
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let token = test_token(secret);
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", token),
+        )
+        .await;
+
+        assert_eq!(
+            "A1 OK SASL authentication successful\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn select_response_uses_crlf_and_tagged_completion() {
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let token = test_token(secret);
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", token),
+        )
+        .await;
+        assert_eq!(
+            "A1 OK SASL authentication successful\r\n",
+            read_line(&mut reader).await
+        );
+
+        write_line(&mut reader, "A2 SELECT INBOX\r\n").await;
+        assert_eq!("* 172 EXISTS\r\n", read_line(&mut reader).await);
+        assert_eq!("* 1 RECENT\r\n", read_line(&mut reader).await);
+        assert_eq!(
+            "* OK [UNSEEN 12] Message 12 is first unseen\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!(
+            "* OK [UIDVALIDITY 3857529045] UIDs valid\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!(
+            "* OK [UIDNEXT 4392] Predicted next UID\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!(
+            "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!(
+            "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!(
+            "A2 OK [READ-WRITE] SELECT completed\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn logout_sends_bye_tagged_ok_and_closes_connection() {
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(&mut reader, "A1 LOGOUT\r\n").await;
+
+        assert_eq!(
+            "* BYE IMAPrev1 Server logging out\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!("A1 OK LOGOUT completed\r\n", read_line(&mut reader).await);
+        server.await;
+
+        let mut eof = String::new();
+        assert_eq!(0, reader.read_line(&mut eof).await.unwrap());
+    }
 }
