@@ -1,11 +1,11 @@
 use async_std::net::TcpListener;
-use base64::{engine::general_purpose, Engine as _};
 use futures::stream::StreamExt;
 use std::env;
 use std::io::{Error, ErrorKind};
 mod connection;
 mod oauth2;
 mod parser;
+mod xoauth2;
 use connection::{Connection, ConnectionState};
 use parser::{Argument, Command};
 
@@ -57,7 +57,7 @@ async fn authenticate(
     initial_response: &Option<Argument>,
 ) -> std::io::Result<usize> {
     if mechanism.eq_ignore_ascii_case("XOAUTH2") {
-        let token = match xoauth2_bearer_token(initial_response) {
+        let token = match xoauth2::bearer_token(initial_response) {
             Ok(token) => token,
             Err(err) => return bad(connection, &err.to_string(), id).await,
         };
@@ -72,61 +72,6 @@ async fn authenticate(
     } else {
         no(connection, id, "Unsupported authentication mechanism").await
     }
-}
-
-fn xoauth2_bearer_token(initial_response: &Option<Argument>) -> std::io::Result<String> {
-    let encoded = initial_response
-        .as_ref()
-        .and_then(Argument::as_utf8)
-        .ok_or_else(invalid_xoauth2_response)?;
-
-    if encoded == "=" {
-        return Err(invalid_xoauth2_response());
-    }
-
-    let decoded = general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|_| invalid_xoauth2_response())?;
-    let decoded = std::str::from_utf8(&decoded).map_err(|_| invalid_xoauth2_response())?;
-
-    if !decoded.ends_with("\x01\x01") {
-        return Err(invalid_xoauth2_response());
-    }
-
-    let mut user = None;
-    let mut bearer_token = None;
-
-    for field in decoded.split('\x01') {
-        if field.is_empty() {
-            continue;
-        }
-
-        if let Some(value) = field.strip_prefix("user=") {
-            if !value.is_empty() {
-                user = Some(value);
-            }
-            continue;
-        }
-
-        if let Some(value) = field.strip_prefix("auth=") {
-            let Some(token) = value.strip_prefix("Bearer ") else {
-                return Err(invalid_xoauth2_response());
-            };
-
-            if !token.is_empty() {
-                bearer_token = Some(token);
-            }
-        }
-    }
-
-    match (user, bearer_token) {
-        (Some(_user), Some(token)) => Ok(token.to_string()),
-        _ => Err(invalid_xoauth2_response()),
-    }
-}
-
-fn invalid_xoauth2_response() -> Error {
-    Error::new(ErrorKind::InvalidInput, "Invalid XOAUTH2 initial response")
 }
 
 async fn capability(connection: &Connection, id: &str) -> std::io::Result<usize> {
@@ -323,7 +268,7 @@ mod tests {
     use async_std::io::BufReader;
     use async_std::net::{TcpListener, TcpStream};
     use async_std::task;
-    use base64::engine::general_purpose;
+    use base64::{engine::general_purpose, Engine as _};
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
     use std::sync::Mutex;
