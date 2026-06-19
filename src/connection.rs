@@ -4,10 +4,14 @@ use async_std::net::TcpStream;
 use std::io::{Error, ErrorKind};
 
 // RFC 2683 recommends that IMAP servers accept command lines of at least
-// 8000 octets. This cap is for the command line only; IMAP literals should
-// be handled separately by reading their declared octet count after a
-// continuation response.
+// 8000 octets. Literal payloads are read separately by declared octet count.
 const MAX_COMMAND_LINE_BYTES: usize = 8192;
+const MAX_LITERAL_BYTES: usize = 16 * 1024 * 1024;
+
+enum CommandPart {
+    Text(String),
+    Literal(String),
+}
 
 enum ConnectionState {
     NOTAUTHENTICATED,
@@ -46,9 +50,31 @@ pub async fn write(connection: &Connection, messages: &[&str]) -> std::io::Resul
 pub async fn read_command(
     connection: &mut Connection,
 ) -> std::io::Result<(String, String, Vec<String>)> {
-    let line = read_command_line(connection).await?;
+    let parts = read_command_parts(connection).await?;
 
-    parse_command(line.as_str())
+    parse_command_parts(parts.as_slice())
+}
+
+async fn read_command_parts(connection: &mut Connection) -> std::io::Result<Vec<CommandPart>> {
+    let mut parts = Vec::new();
+
+    loop {
+        let line = read_command_line(connection).await?;
+
+        match parse_literal_marker(&line)? {
+            Some((literal_length, prefix)) => {
+                parts.push(CommandPart::Text(prefix));
+                write(connection, &["+ Ready for literal data\r\n"]).await?;
+                parts.push(CommandPart::Literal(
+                    read_literal(connection, literal_length).await?,
+                ));
+            }
+            None => {
+                parts.push(CommandPart::Text(line));
+                return Ok(parts);
+            }
+        }
+    }
 }
 
 async fn read_command_line(connection: &mut Connection) -> std::io::Result<String> {
@@ -93,27 +119,83 @@ async fn read_command_line(connection: &mut Connection) -> std::io::Result<Strin
 }
 
 fn parse_command(line: &str) -> std::io::Result<(String, String, Vec<String>)> {
-    let command = line.trim_end_matches(&['\r', '\n'][..]);
+    parse_command_parts(&[CommandPart::Text(line.to_string())])
+}
 
-    let v: Vec<&str> = command.splitn(3, ' ').collect();
+fn parse_command_parts(parts: &[CommandPart]) -> std::io::Result<(String, String, Vec<String>)> {
+    let mut tokens = Vec::new();
 
-    let length = v.len();
-    if length > 3 || length < 2 {
+    for part in parts {
+        match part {
+            CommandPart::Text(text) => {
+                let text = text.trim_end_matches(&['\r', '\n'][..]);
+                tokens.extend(text.split_whitespace().map(String::from));
+            }
+            CommandPart::Literal(literal) => tokens.push(literal.to_string()),
+        }
+    }
+
+    if tokens.len() < 2 {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "Client commands should have at least an identifier and a valid IMAPrev1 command\n",
         ));
     }
 
-    let command = v[1].to_string();
-    let tag = v[0].to_string();
-    let mut args: Vec<String> = Vec::new();
-
-    if length == 3 {
-        args = v[2].split(' ').map(String::from).collect();
-    }
+    let tag = tokens[0].to_string();
+    let command = tokens[1].to_string();
+    let args = tokens[2..].to_vec();
 
     Ok((command, tag, args))
+}
+
+fn parse_literal_marker(line: &str) -> std::io::Result<Option<(usize, String)>> {
+    let line = line.trim_end_matches(&['\r', '\n'][..]);
+
+    if !line.ends_with('}') {
+        return Ok(None);
+    }
+
+    let Some(marker_start) = line.rfind('{') else {
+        return Ok(None);
+    };
+
+    let literal_length = &line[marker_start + 1..line.len() - 1];
+
+    if literal_length.is_empty() || !literal_length.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(None);
+    }
+
+    let literal_length = literal_length.parse::<usize>().map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "Client literal length is not valid\n",
+        )
+    })?;
+
+    if literal_length > MAX_LITERAL_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Client literal exceeds maximum length\n",
+        ));
+    }
+
+    Ok(Some((literal_length, line[..marker_start].to_string())))
+}
+
+async fn read_literal(
+    connection: &mut Connection,
+    literal_length: usize,
+) -> std::io::Result<String> {
+    let mut literal = vec![0; literal_length];
+    connection.reader.read_exact(literal.as_mut_slice()).await?;
+
+    String::from_utf8(literal).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "Client literal should be valid UTF-8\n",
+        )
+    })
 }
 
 pub fn set_authenticated_state(connection: &mut Connection) {
@@ -199,5 +281,93 @@ mod tests {
             "Client command exceeds maximum line length\n",
             err.to_string()
         );
+    }
+
+    #[async_std::test]
+    async fn read_command_reads_literal_as_single_argument() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = task::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"A1 AUTHENTICATE XOAUTH2 {11}\r\n")
+                .await
+                .unwrap();
+
+            let mut continuation = vec![0; "+ Ready for literal data\r\n".len()];
+            stream
+                .read_exact(continuation.as_mut_slice())
+                .await
+                .unwrap();
+            assert_eq!(b"+ Ready for literal data\r\n", continuation.as_slice());
+
+            stream.write_all(b"hello world\r\n").await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = new(stream);
+
+        let (command, tag, args) = read_command(&mut connection).await.unwrap();
+
+        client.await;
+
+        assert_eq!("AUTHENTICATE", command);
+        assert_eq!("A1", tag);
+        assert_eq!(vec!["XOAUTH2", "hello world"], args);
+    }
+
+    #[async_std::test]
+    async fn read_command_allows_literal_payloads_to_contain_crlf() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = task::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"A1 LOGIN {12}\r\n").await.unwrap();
+
+            let mut continuation = vec![0; "+ Ready for literal data\r\n".len()];
+            stream
+                .read_exact(continuation.as_mut_slice())
+                .await
+                .unwrap();
+
+            stream.write_all(b"hello\r\nworld\r\n").await.unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = new(stream);
+
+        let (command, tag, args) = read_command(&mut connection).await.unwrap();
+
+        client.await;
+
+        assert_eq!("LOGIN", command);
+        assert_eq!("A1", tag);
+        assert_eq!(vec!["hello\r\nworld"], args);
+    }
+
+    #[async_std::test]
+    async fn read_command_rejects_oversized_literal_before_continuation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = task::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("A1 LOGIN {{{}}}\r\n", MAX_LITERAL_BYTES + 1).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = new(stream);
+
+        let err = read_command(&mut connection).await.unwrap_err();
+
+        client.await;
+
+        assert_eq!(ErrorKind::InvalidInput, err.kind());
+        assert_eq!("Client literal exceeds maximum length\n", err.to_string());
     }
 }
