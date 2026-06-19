@@ -1,4 +1,5 @@
 use async_std::net::TcpListener;
+use base64::{engine::general_purpose, Engine as _};
 use futures::stream::StreamExt;
 use std::env;
 use std::io::{Error, ErrorKind};
@@ -55,21 +56,77 @@ async fn authenticate(
     mechanism: &str,
     initial_response: &Option<Argument>,
 ) -> std::io::Result<usize> {
-    let token = match initial_response.as_ref().and_then(Argument::as_utf8) {
-        Some(token) => token,
-        None => return bad(connection, "Arguments invalid\n", id).await,
-    };
+    if mechanism.eq_ignore_ascii_case("XOAUTH2") {
+        let token = match xoauth2_bearer_token(initial_response) {
+            Ok(token) => token,
+            Err(err) => return bad(connection, &err.to_string(), id).await,
+        };
 
-    match mechanism {
-        "XOAUTH2" => match oauth2::authenticate(token) {
+        match oauth2::authenticate(&token) {
             Ok(_claims) => {
                 connection::set_authenticated_state(connection);
                 ok(connection, id, "SASL authentication successful").await
             }
             _err => no(connection, id, "Invalid credentials").await,
-        },
-        _other => no(connection, id, "Unsupported authentication mechanism").await,
+        }
+    } else {
+        no(connection, id, "Unsupported authentication mechanism").await
     }
+}
+
+fn xoauth2_bearer_token(initial_response: &Option<Argument>) -> std::io::Result<String> {
+    let encoded = initial_response
+        .as_ref()
+        .and_then(Argument::as_utf8)
+        .ok_or_else(invalid_xoauth2_response)?;
+
+    if encoded == "=" {
+        return Err(invalid_xoauth2_response());
+    }
+
+    let decoded = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_xoauth2_response())?;
+    let decoded = std::str::from_utf8(&decoded).map_err(|_| invalid_xoauth2_response())?;
+
+    if !decoded.ends_with("\x01\x01") {
+        return Err(invalid_xoauth2_response());
+    }
+
+    let mut user = None;
+    let mut bearer_token = None;
+
+    for field in decoded.split('\x01') {
+        if field.is_empty() {
+            continue;
+        }
+
+        if let Some(value) = field.strip_prefix("user=") {
+            if !value.is_empty() {
+                user = Some(value);
+            }
+            continue;
+        }
+
+        if let Some(value) = field.strip_prefix("auth=") {
+            let Some(token) = value.strip_prefix("Bearer ") else {
+                return Err(invalid_xoauth2_response());
+            };
+
+            if !token.is_empty() {
+                bearer_token = Some(token);
+            }
+        }
+    }
+
+    match (user, bearer_token) {
+        (Some(_user), Some(token)) => Ok(token.to_string()),
+        _ => Err(invalid_xoauth2_response()),
+    }
+}
+
+fn invalid_xoauth2_response() -> Error {
+    Error::new(ErrorKind::InvalidInput, "Invalid XOAUTH2 initial response")
 }
 
 async fn capability(connection: &Connection, id: &str) -> std::io::Result<usize> {
@@ -266,6 +323,7 @@ mod tests {
     use async_std::io::BufReader;
     use async_std::net::{TcpListener, TcpStream};
     use async_std::task;
+    use base64::engine::general_purpose;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
     use std::sync::Mutex;
@@ -333,6 +391,13 @@ mod tests {
         .unwrap()
     }
 
+    fn xoauth2_initial_response(token: &str) -> String {
+        general_purpose::STANDARD.encode(format!(
+            "user=test@example.com\x01auth=Bearer {}\x01\x01",
+            token
+        ))
+    }
+
     #[async_std::test]
     async fn connection_starts_with_imap_greeting() {
         let (mut reader, server) = connect_to_server().await;
@@ -371,12 +436,13 @@ mod tests {
             env::set_var("JWT_SECRET", secret);
         }
         let token = test_token(secret);
+        let xoauth2 = xoauth2_initial_response(&token);
         let (mut reader, server) = connect_to_server().await;
 
         read_line(&mut reader).await;
         write_line(
             &mut reader,
-            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", token),
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", xoauth2),
         )
         .await;
 
@@ -396,12 +462,13 @@ mod tests {
             env::set_var("JWT_SECRET", secret);
         }
         let token = test_token(secret);
+        let xoauth2 = xoauth2_initial_response(&token);
         let (mut reader, server) = connect_to_server().await;
 
         read_line(&mut reader).await;
         write_line(
             &mut reader,
-            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", token),
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", xoauth2),
         )
         .await;
         assert_eq!(
@@ -446,10 +513,142 @@ mod tests {
         unsafe {
             env::remove_var("JWT_SECRET");
         }
+        let xoauth2 = xoauth2_initial_response("token");
         let (mut reader, server) = connect_to_server().await;
 
         read_line(&mut reader).await;
-        write_line(&mut reader, "A1 AUTHENTICATE XOAUTH2 token\r\n").await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", xoauth2),
+        )
+        .await;
+
+        assert_eq!(
+            "A1 NO Invalid credentials\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_rejects_raw_token_initial_response() {
+        let _guard = lock_auth_env();
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let token = test_token(secret);
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", token),
+        )
+        .await;
+
+        assert_eq!(
+            "A1 BAD Invalid XOAUTH2 initial response\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_rejects_malformed_xoauth2_base64() {
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(&mut reader, "A1 AUTHENTICATE XOAUTH2 not-base64!\r\n").await;
+
+        assert_eq!(
+            "A1 BAD Invalid XOAUTH2 initial response\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_rejects_xoauth2_without_bearer_token() {
+        let initial_response =
+            general_purpose::STANDARD.encode("user=test@example.com\x01auth=Bearer \x01\x01");
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", initial_response),
+        )
+        .await;
+
+        assert_eq!(
+            "A1 BAD Invalid XOAUTH2 initial response\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_rejects_xoauth2_unsupported_auth_scheme() {
+        let initial_response =
+            general_purpose::STANDARD.encode("user=test@example.com\x01auth=Basic token\x01\x01");
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", initial_response),
+        )
+        .await;
+
+        assert_eq!(
+            "A1 BAD Invalid XOAUTH2 initial response\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_rejects_xoauth2_without_terminator() {
+        let initial_response =
+            general_purpose::STANDARD.encode("user=test@example.com\x01auth=Bearer token");
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", initial_response),
+        )
+        .await;
+
+        assert_eq!(
+            "A1 BAD Invalid XOAUTH2 initial response\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_rejects_xoauth2_invalid_bearer_token() {
+        let _guard = lock_auth_env();
+        unsafe {
+            env::set_var("JWT_SECRET", "test-secret");
+        }
+        let xoauth2 = xoauth2_initial_response("not-a-jwt");
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(
+            &mut reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", xoauth2),
+        )
+        .await;
 
         assert_eq!(
             "A1 NO Invalid credentials\r\n",

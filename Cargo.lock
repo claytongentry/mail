@@ -838,6 +838,7 @@ name = "mail"
 version = "0.1.0"
 dependencies = [
  "async-std",
+ "base64",
  "diesel",
  "futures",
  "jsonwebtoken",

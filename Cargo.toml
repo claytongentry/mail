@@ -7,6 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+base64 = "0.22.1"
 diesel = { version = "2.3.10", features = ["sqlite"] }
 futures = "0.3.32"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
