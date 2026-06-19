@@ -1,1 +1,4 @@
-eval $(cat .secrets.dev) cargo run
+#!/usr/bin/env sh
+set -eu
+
+exec just start

@@ -1,5 +1,6 @@
 use async_std::net::TcpListener;
 use futures::stream::StreamExt;
+use std::env;
 use std::io::{Error, ErrorKind};
 mod connection;
 mod oauth2;
@@ -172,13 +173,15 @@ async fn handle_connection(connection: &mut Connection) {
 
 #[async_std::main]
 async fn main() {
-    println!("IMAPrev1 listening on 1143...");
+    let bind_addr =
+        env::var("IMAP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
+    println!("IMAPrev1 listening on {}...", bind_addr);
 
     /*
      * IMAPrev1 servers listen on port 143
      * https://tools.ietf.org/html/rfc2060#section-2.1
      */
-    let listener = TcpListener::bind("127.0.0.1:1143").await.unwrap();
+    let listener = TcpListener::bind(bind_addr.as_str()).await.unwrap();
 
     // accept connections concurrently
     listener

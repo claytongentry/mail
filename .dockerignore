@@ -1,0 +1,5 @@
+.git
+target
+.secrets*
+*.sqlite
+*.sqlite3
