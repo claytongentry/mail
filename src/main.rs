@@ -173,8 +173,7 @@ async fn handle_connection(connection: &mut Connection) {
 
 #[async_std::main]
 async fn main() {
-    let bind_addr =
-        env::var("IMAP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
+    let bind_addr = env::var("IMAP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
     println!("IMAPrev1 listening on {}...", bind_addr);
 
     /*
