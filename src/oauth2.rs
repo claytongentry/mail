@@ -15,13 +15,13 @@ fn get_key() -> std::string::String {
 }
 
 pub fn authenticate(
-    token: &String,
+    token: &str,
 ) -> std::result::Result<TokenData<Claims>, jsonwebtoken::errors::Error> {
     let key = get_key();
     let key_ref = key.as_ref();
 
     decode::<Claims>(
-        &token,
+        token,
         &DecodingKey::from_secret(key_ref),
         &Validation::new(Algorithm::HS256),
     )

@@ -4,7 +4,7 @@ use std::env;
 use std::io::{Error, ErrorKind};
 mod connection;
 mod oauth2;
-use connection::Connection;
+use connection::{Argument, Command, Connection};
 
 async fn bad(connection: &Connection, message: &str, tag: &String) -> std::io::Result<usize> {
     let response = tag.to_string() + &(" BAD ".to_string()) + &message.to_string();
@@ -23,16 +23,22 @@ async fn bad(connection: &Connection, message: &str, tag: &String) -> std::io::R
 async fn authenticate(
     connection: &mut Connection,
     id: &String,
-    args: Vec<String>,
+    args: &[Argument],
 ) -> std::io::Result<usize> {
     if args.len() != 2 {
         return bad(connection, &"Arguments invalid\n", id).await;
     }
 
-    let mechanism = &args[0];
-    let token = &args[1];
+    let mechanism = match args[0].as_utf8() {
+        Some(mechanism) => mechanism,
+        None => return bad(connection, &"Arguments invalid\n", id).await,
+    };
+    let token = match args[1].as_utf8() {
+        Some(token) => token,
+        None => return bad(connection, &"Arguments invalid\n", id).await,
+    };
 
-    match mechanism.as_str() {
+    match mechanism {
         "XOAUTH2" => match oauth2::authenticate(token) {
             Ok(_claims) => {
                 connection::set_authenticated_state(connection);
@@ -123,21 +129,16 @@ async fn select(connection: &Connection, id: &String) -> std::io::Result<usize> 
  ****************************************************************
  */
 
-async fn handle_command(
-    command: &String,
-    id: &String,
-    args: Vec<String>,
-    connection: &mut Connection,
-) -> std::io::Result<usize> {
-    match command.as_str() {
-        "AUTHENTICATE" => authenticate(connection, id, args).await,
-        "CAPABILITY" => capability(connection, id).await,
-        "LOGIN" => login(connection, id).await,
-        "LOGOUT" => logout(connection, id).await,
-        "NOOP" => noop(connection, id).await,
-        "SELECT" => select(connection, id).await,
+async fn handle_command(command: &Command, connection: &mut Connection) -> std::io::Result<usize> {
+    match command.name.as_str() {
+        "AUTHENTICATE" => authenticate(connection, &command.tag, command.args.as_slice()).await,
+        "CAPABILITY" => capability(connection, &command.tag).await,
+        "LOGIN" => login(connection, &command.tag).await,
+        "LOGOUT" => logout(connection, &command.tag).await,
+        "NOOP" => noop(connection, &command.tag).await,
+        "SELECT" => select(connection, &command.tag).await,
         _other => {
-            let message = command.to_string() + " is not a valid command.\n";
+            let message = command.name.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))
         }
     }
@@ -146,8 +147,10 @@ async fn handle_command(
 async fn handle_connection(connection: &mut Connection) {
     loop {
         match connection::read_command(connection).await {
-            Ok((command, tag, args)) => {
-                let _ = match handle_command(&command, &tag, args, connection).await {
+            Ok(command) => {
+                let tag = command.tag.to_string();
+                let name = command.name.to_string();
+                let _ = match handle_command(&command, connection).await {
                     Ok(val) => Ok(val),
                     Err(err) => match err.kind() {
                         ErrorKind::BrokenPipe => break,
@@ -157,7 +160,7 @@ async fn handle_connection(connection: &mut Connection) {
                 };
 
                 // Can use this space to close connections as needed
-                match command.as_str() {
+                match name.as_str() {
                     "LOGOUT" => break,
                     other => other,
                 };
