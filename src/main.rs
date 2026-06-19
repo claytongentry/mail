@@ -4,9 +4,11 @@ use std::env;
 use std::io::{Error, ErrorKind};
 mod connection;
 mod oauth2;
-use connection::{Argument, Command, Connection};
+mod parser;
+use connection::Connection;
+use parser::{Argument, Command};
 
-async fn bad(connection: &Connection, message: &str, tag: &String) -> std::io::Result<usize> {
+async fn bad(connection: &Connection, message: &str, tag: &str) -> std::io::Result<usize> {
     let response = tag.to_string() + &(" BAD ".to_string()) + &message.to_string();
     connection::write(connection, &[&response]).await
 }
@@ -22,20 +24,13 @@ async fn bad(connection: &Connection, message: &str, tag: &String) -> std::io::R
  */
 async fn authenticate(
     connection: &mut Connection,
-    id: &String,
-    args: &[Argument],
+    id: &str,
+    mechanism: &str,
+    initial_response: &Option<Argument>,
 ) -> std::io::Result<usize> {
-    if args.len() != 2 {
-        return bad(connection, &"Arguments invalid\n", id).await;
-    }
-
-    let mechanism = match args[0].as_utf8() {
-        Some(mechanism) => mechanism,
-        None => return bad(connection, &"Arguments invalid\n", id).await,
-    };
-    let token = match args[1].as_utf8() {
+    let token = match initial_response.as_ref().and_then(Argument::as_utf8) {
         Some(token) => token,
-        None => return bad(connection, &"Arguments invalid\n", id).await,
+        None => return bad(connection, "Arguments invalid\n", id).await,
     };
 
     match mechanism {
@@ -62,7 +57,7 @@ async fn authenticate(
     }
 }
 
-async fn capability(connection: &Connection, id: &String) -> std::io::Result<usize> {
+async fn capability(connection: &Connection, id: &str) -> std::io::Result<usize> {
     connection::write(
         connection,
         &[
@@ -73,7 +68,7 @@ async fn capability(connection: &Connection, id: &String) -> std::io::Result<usi
     .await
 }
 
-async fn login(connection: &Connection, id: &String) -> std::io::Result<usize> {
+async fn login(connection: &Connection, id: &str) -> std::io::Result<usize> {
     connection::write(
         connection,
         &[&(id.to_string() + " NO Login is disabled.\n")],
@@ -81,7 +76,7 @@ async fn login(connection: &Connection, id: &String) -> std::io::Result<usize> {
     .await
 }
 
-async fn logout(connection: &mut Connection, id: &String) -> std::io::Result<usize> {
+async fn logout(connection: &mut Connection, id: &str) -> std::io::Result<usize> {
     connection::set_logout_state(connection);
     connection::write(
         connection,
@@ -102,11 +97,11 @@ async fn logout(connection: &mut Connection, id: &String) -> std::io::Result<usi
     on the server.
 * https://tools.ietf.org/html/rfc2060#section-6.1.2
 */
-async fn noop(connection: &Connection, id: &String) -> std::io::Result<usize> {
+async fn noop(connection: &Connection, id: &str) -> std::io::Result<usize> {
     connection::write(connection, &[&(id.to_string() + " OK NOOP completed\n")]).await
 }
 
-async fn select(connection: &Connection, id: &String) -> std::io::Result<usize> {
+async fn select(connection: &Connection, id: &str) -> std::io::Result<usize> {
     connection::write(
         connection,
         &[
@@ -130,15 +125,19 @@ async fn select(connection: &Connection, id: &String) -> std::io::Result<usize> 
  */
 
 async fn handle_command(command: &Command, connection: &mut Connection) -> std::io::Result<usize> {
-    match command.name.as_str() {
-        "AUTHENTICATE" => authenticate(connection, &command.tag, command.args.as_slice()).await,
-        "CAPABILITY" => capability(connection, &command.tag).await,
-        "LOGIN" => login(connection, &command.tag).await,
-        "LOGOUT" => logout(connection, &command.tag).await,
-        "NOOP" => noop(connection, &command.tag).await,
-        "SELECT" => select(connection, &command.tag).await,
-        _other => {
-            let message = command.name.to_string() + " is not a valid command.\n";
+    match command {
+        Command::Authenticate {
+            tag,
+            mechanism,
+            initial_response,
+        } => authenticate(connection, tag, mechanism, initial_response).await,
+        Command::Capability { tag } => capability(connection, tag).await,
+        Command::Login { tag, .. } => login(connection, tag).await,
+        Command::Logout { tag } => logout(connection, tag).await,
+        Command::Noop { tag } => noop(connection, tag).await,
+        Command::Select { tag, .. } => select(connection, tag).await,
+        Command::Unknown { name, .. } => {
+            let message = name.to_string() + " is not a valid command.\n";
             Err(Error::new(ErrorKind::InvalidInput, message))
         }
     }
@@ -148,8 +147,8 @@ async fn handle_connection(connection: &mut Connection) {
     loop {
         match connection::read_command(connection).await {
             Ok(command) => {
-                let tag = command.tag.to_string();
-                let name = command.name.to_string();
+                let tag = command.tag().to_string();
+                let name = command.name().to_string();
                 let _ = match handle_command(&command, connection).await {
                     Ok(val) => Ok(val),
                     Err(err) => match err.kind() {
