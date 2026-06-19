@@ -1,23 +1,37 @@
-use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
-};
-use serde::{Deserialize, Serialize};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, TokenData, Validation};
+use serde::Deserialize;
 use std::env;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fmt;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Claims {
-    exp: u64,
+    pub exp: u64,
 }
 
-fn get_key() -> std::string::String {
-    env::var("JWT_SECRET").unwrap()
+#[derive(Debug)]
+pub enum AuthError {
+    MissingSecret,
+    InvalidToken(jsonwebtoken::errors::Error),
 }
 
-pub fn authenticate(
-    token: &str,
-) -> std::result::Result<TokenData<Claims>, jsonwebtoken::errors::Error> {
-    let key = get_key();
+impl fmt::Display for AuthError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthError::MissingSecret => write!(formatter, "JWT_SECRET is not configured"),
+            AuthError::InvalidToken(err) => write!(formatter, "{}", err),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
+
+fn get_key() -> Result<String, AuthError> {
+    env::var("JWT_SECRET").map_err(|_| AuthError::MissingSecret)
+}
+
+pub fn authenticate(token: &str) -> Result<TokenData<Claims>, AuthError> {
+    let key = get_key()?;
     let key_ref = key.as_ref();
 
     decode::<Claims>(
@@ -25,22 +39,5 @@ pub fn authenticate(
         &DecodingKey::from_secret(key_ref),
         &Validation::new(Algorithm::HS256),
     )
-}
-
-fn issue() -> String {
-    let one_hour = Duration::new(60 * 60, 0);
-    let in_one_hour = SystemTime::now() + one_hour;
-    let exp = in_one_hour.duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-    let claims = Claims { exp: exp };
-
-    let key = get_key();
-    let key_ref = key.as_ref();
-
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(key_ref),
-    )
-    .unwrap()
+    .map_err(AuthError::InvalidToken)
 }

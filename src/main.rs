@@ -205,7 +205,10 @@ async fn handle_connection(connection: &mut Connection) {
                     Err(err) => match err.kind() {
                         ErrorKind::BrokenPipe => break,
                         ErrorKind::InvalidInput => bad(&connection, &err.to_string(), &tag).await,
-                        _other => panic!("Error!, {:?}", err),
+                        _other => {
+                            eprintln!("Connection error: {}", err);
+                            break;
+                        }
                     },
                 };
 
@@ -229,7 +232,7 @@ async fn handle_connection(connection: &mut Connection) {
 }
 
 #[async_std::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let bind_addr = env::var("IMAP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
     println!("IMAPrev1 listening on {}...", bind_addr);
 
@@ -237,17 +240,23 @@ async fn main() {
      * IMAPrev1 servers listen on port 143
      * https://tools.ietf.org/html/rfc2060#section-2.1
      */
-    let listener = TcpListener::bind(bind_addr.as_str()).await.unwrap();
+    let listener = TcpListener::bind(bind_addr.as_str()).await?;
 
     // accept connections concurrently
     listener
         .incoming()
         .for_each_concurrent(/* limit */ None, |stream| async move {
-            let stream = stream.unwrap();
-            let mut conn = connection::new(stream);
-            handle_connection(&mut conn).await;
+            match stream {
+                Ok(stream) => {
+                    let mut conn = connection::new(stream);
+                    handle_connection(&mut conn).await;
+                }
+                Err(err) => eprintln!("Failed to accept connection: {}", err),
+            }
         })
-        .await
+        .await;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -259,7 +268,16 @@ mod tests {
     use async_std::task;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_auth_env() -> std::sync::MutexGuard<'static, ()> {
+        AUTH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[derive(Serialize)]
     struct TestClaims {
@@ -347,6 +365,7 @@ mod tests {
 
     #[async_std::test]
     async fn authenticate_success_is_tagged_and_crlf_terminated() {
+        let _guard = lock_auth_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -371,6 +390,7 @@ mod tests {
 
     #[async_std::test]
     async fn select_response_uses_crlf_and_tagged_completion() {
+        let _guard = lock_auth_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -418,6 +438,53 @@ mod tests {
         );
 
         logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn authenticate_without_jwt_secret_returns_tagged_no() {
+        let _guard = lock_auth_env();
+        unsafe {
+            env::remove_var("JWT_SECRET");
+        }
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(&mut reader, "A1 AUTHENTICATE XOAUTH2 token\r\n").await;
+
+        assert_eq!(
+            "A1 NO Invalid credentials\r\n",
+            read_line(&mut reader).await
+        );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn malformed_command_returns_bad_and_connection_continues() {
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(&mut reader, "A1 SELECT\r\n").await;
+
+        assert_eq!(
+            "* BAD Client command has invalid arguments\r\n",
+            read_line(&mut reader).await
+        );
+
+        write_line(&mut reader, "A2 NOOP\r\n").await;
+        assert_eq!("A2 OK NOOP completed\r\n", read_line(&mut reader).await);
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn client_disconnect_after_greeting_exits_without_panic() {
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        drop(reader);
+
+        server.await;
     }
 
     #[async_std::test]
