@@ -2,12 +2,15 @@ use async_std::net::TcpListener;
 use futures::stream::StreamExt;
 use std::env;
 use std::io::{Error, ErrorKind};
+use std::sync::Arc;
 mod connection;
 mod oauth2;
 mod parser;
+mod store;
 mod xoauth2;
 use connection::{Connection, ConnectionState};
 use parser::{Argument, Command};
+use store::{FixtureMailStore, MailStore, MailboxSelection, MessageFlag};
 
 const GREETING: &str = "* OK IMAP4rev1 Service Ready\r\n";
 
@@ -114,21 +117,69 @@ async fn noop(connection: &Connection, id: &str) -> std::io::Result<usize> {
     ok(connection, id, "NOOP completed").await
 }
 
-async fn select(connection: &Connection, id: &str) -> std::io::Result<usize> {
-    write_messages(
-        connection,
-        vec![
-            untagged("172 EXISTS"),
-            untagged("1 RECENT"),
-            untagged("OK [UNSEEN 12] Message 12 is first unseen"),
-            untagged("OK [UIDVALIDITY 3857529045] UIDs valid"),
-            untagged("OK [UIDNEXT 4392] Predicted next UID"),
-            untagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)"),
-            untagged("OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited"),
-            tagged(id, "OK", "[READ-WRITE] SELECT completed"),
-        ],
-    )
-    .await
+async fn select(
+    connection: &Connection,
+    id: &str,
+    mailbox: &Argument,
+    store: &(impl MailStore + ?Sized),
+) -> std::io::Result<usize> {
+    let mailbox = match mailbox.as_utf8() {
+        Some(mailbox) => mailbox,
+        None => {
+            return bad(connection, "Client command has invalid arguments", id).await;
+        }
+    };
+    let selection = match store.select_mailbox(mailbox) {
+        Ok(selection) => selection,
+        Err(err) => return no(connection, id, &err.to_string()).await,
+    };
+
+    write_selection(connection, id, &selection).await
+}
+
+async fn write_selection(
+    connection: &Connection,
+    id: &str,
+    selection: &MailboxSelection,
+) -> std::io::Result<usize> {
+    let mut messages = vec![
+        untagged(&format!("{} EXISTS", selection.exists)),
+        untagged(&format!("{} RECENT", selection.recent)),
+    ];
+
+    if let Some(message) = selection.first_unseen {
+        messages.push(untagged(&format!(
+            "OK [UNSEEN {}] Message {} is first unseen",
+            message, message
+        )));
+    }
+
+    messages.extend([
+        untagged(&format!(
+            "OK [UIDVALIDITY {}] UIDs valid",
+            selection.uid_validity
+        )),
+        untagged(&format!(
+            "OK [UIDNEXT {}] Predicted next UID",
+            selection.uid_next
+        )),
+        untagged(&format!("FLAGS ({})", format_flags(&selection.flags))),
+        untagged(&format!(
+            "OK [PERMANENTFLAGS ({})] Limited",
+            format_flags(&selection.permanent_flags)
+        )),
+        tagged(id, "OK", "[READ-WRITE] SELECT completed"),
+    ]);
+
+    write_messages(connection, messages).await
+}
+
+fn format_flags(flags: &[MessageFlag]) -> String {
+    flags
+        .iter()
+        .map(MessageFlag::as_imap)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /**
@@ -137,7 +188,11 @@ async fn select(connection: &Connection, id: &str) -> std::io::Result<usize> {
  ****************************************************************
  */
 
-async fn handle_command(command: &Command, connection: &mut Connection) -> std::io::Result<usize> {
+async fn handle_command(
+    command: &Command,
+    connection: &mut Connection,
+    store: &(impl MailStore + ?Sized),
+) -> std::io::Result<usize> {
     let state = connection::state(connection);
 
     if !command_is_valid_for_state(command, state) {
@@ -161,7 +216,7 @@ async fn handle_command(command: &Command, connection: &mut Connection) -> std::
         Command::Login { tag, .. } => login(connection, tag).await,
         Command::Logout { tag } => logout(connection, tag).await,
         Command::Noop { tag } => noop(connection, tag).await,
-        Command::Select { tag, .. } => select(connection, tag).await,
+        Command::Select { tag, mailbox } => select(connection, tag, mailbox, store).await,
         Command::Unknown { name, .. } => {
             let message = name.to_string() + " is not a valid command.";
             Err(Error::new(ErrorKind::InvalidInput, message))
@@ -192,7 +247,7 @@ fn command_is_valid_for_state(command: &Command, state: ConnectionState) -> bool
     }
 }
 
-async fn handle_connection(connection: &mut Connection) {
+async fn handle_connection(connection: &mut Connection, store: &(impl MailStore + ?Sized)) {
     if connection::write(connection, &[GREETING]).await.is_err() {
         return;
     }
@@ -202,7 +257,7 @@ async fn handle_connection(connection: &mut Connection) {
             Ok(command) => {
                 let tag = command.tag().to_string();
                 let name = command.name().to_string();
-                let _ = match handle_command(&command, connection).await {
+                let _ = match handle_command(&command, connection, store).await {
                     Ok(val) => Ok(val),
                     Err(err) => match err.kind() {
                         ErrorKind::BrokenPipe => break,
@@ -236,6 +291,7 @@ async fn handle_connection(connection: &mut Connection) {
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let bind_addr = env::var("IMAP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
+    let store = Arc::new(FixtureMailStore);
     println!("IMAPrev1 listening on {}...", bind_addr);
 
     /*
@@ -247,13 +303,17 @@ async fn main() -> std::io::Result<()> {
     // accept connections concurrently
     listener
         .incoming()
-        .for_each_concurrent(/* limit */ None, |stream| async move {
-            match stream {
-                Ok(stream) => {
-                    let mut conn = connection::new(stream);
-                    handle_connection(&mut conn).await;
+        .for_each_concurrent(/* limit */ None, |stream| {
+            let store = Arc::clone(&store);
+
+            async move {
+                match stream {
+                    Ok(stream) => {
+                        let mut conn = connection::new(stream);
+                        handle_connection(&mut conn, store.as_ref()).await;
+                    }
+                    Err(err) => eprintln!("Failed to accept connection: {}", err),
                 }
-                Err(err) => eprintln!("Failed to accept connection: {}", err),
             }
         })
         .await;
@@ -294,7 +354,25 @@ mod tests {
         let server = task::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut connection = connection::new(stream);
-            handle_connection(&mut connection).await;
+            let store = FixtureMailStore;
+            handle_connection(&mut connection, &store).await;
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+
+        (BufReader::new(client), server)
+    }
+
+    async fn connect_to_server_with_store(
+        store: impl MailStore + Send + 'static,
+    ) -> (BufReader<TcpStream>, task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = task::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = connection::new(stream);
+            handle_connection(&mut connection, &store).await;
         });
 
         let client = TcpStream::connect(addr).await.unwrap();
@@ -310,6 +388,50 @@ mod tests {
 
     async fn write_line(reader: &mut BufReader<TcpStream>, line: &str) {
         reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    }
+
+    async fn authenticate_client(reader: &mut BufReader<TcpStream>, secret: &str) {
+        let token = test_token(secret);
+        let xoauth2 = xoauth2_initial_response(&token);
+
+        write_line(
+            reader,
+            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", xoauth2),
+        )
+        .await;
+        assert_eq!(
+            "A1 OK SASL authentication successful\r\n",
+            read_line(reader).await
+        );
+    }
+
+    async fn assert_fixture_select_response(reader: &mut BufReader<TcpStream>, tag: &str) {
+        assert_eq!("* 172 EXISTS\r\n", read_line(reader).await);
+        assert_eq!("* 1 RECENT\r\n", read_line(reader).await);
+        assert_eq!(
+            "* OK [UNSEEN 12] Message 12 is first unseen\r\n",
+            read_line(reader).await
+        );
+        assert_eq!(
+            "* OK [UIDVALIDITY 3857529045] UIDs valid\r\n",
+            read_line(reader).await
+        );
+        assert_eq!(
+            "* OK [UIDNEXT 4392] Predicted next UID\r\n",
+            read_line(reader).await
+        );
+        assert_eq!(
+            "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n",
+            read_line(reader).await
+        );
+        assert_eq!(
+            "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n",
+            read_line(reader).await
+        );
+        assert_eq!(
+            format!("{} OK [READ-WRITE] SELECT completed\r\n", tag),
+            read_line(reader).await
+        );
     }
 
     async fn logout(reader: &mut BufReader<TcpStream>, server: task::JoinHandle<()>) {
@@ -406,42 +528,113 @@ mod tests {
         unsafe {
             env::set_var("JWT_SECRET", secret);
         }
-        let token = test_token(secret);
-        let xoauth2 = xoauth2_initial_response(&token);
         let (mut reader, server) = connect_to_server().await;
 
         read_line(&mut reader).await;
-        write_line(
-            &mut reader,
-            &format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", xoauth2),
-        )
-        .await;
-        assert_eq!(
-            "A1 OK SASL authentication successful\r\n",
-            read_line(&mut reader).await
-        );
+        authenticate_client(&mut reader, secret).await;
 
         write_line(&mut reader, "A2 SELECT INBOX\r\n").await;
-        assert_eq!("* 172 EXISTS\r\n", read_line(&mut reader).await);
-        assert_eq!("* 1 RECENT\r\n", read_line(&mut reader).await);
+        assert_fixture_select_response(&mut reader, "A2").await;
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn select_inbox_is_case_insensitive() {
+        let _guard = lock_auth_env();
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        authenticate_client(&mut reader, secret).await;
+
+        write_line(&mut reader, "A2 SELECT inbox\r\n").await;
+        assert_fixture_select_response(&mut reader, "A2").await;
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn missing_literal_mailbox_does_not_inject_response_lines() {
+        let _guard = lock_auth_env();
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        authenticate_client(&mut reader, secret).await;
+
+        write_line(&mut reader, "A2 SELECT {16}\r\n").await;
+        assert_eq!("+ Ready for literal data\r\n", read_line(&mut reader).await);
+        reader
+            .get_mut()
+            .write_all(b"x\r\n* OK injected")
+            .await
+            .unwrap();
+
+        assert_eq!("A2 NO Mailbox does not exist\r\n", read_line(&mut reader).await);
+
+        write_line(&mut reader, "A3 NOOP\r\n").await;
+        assert_eq!("A3 OK NOOP completed\r\n", read_line(&mut reader).await);
+
+        logout(&mut reader, server).await;
+    }
+
+    struct TestMailStore {
+        selection: MailboxSelection,
+    }
+
+    impl MailStore for TestMailStore {
+        fn select_mailbox(&self, _mailbox: &str) -> store::MailStoreResult<MailboxSelection> {
+            Ok(self.selection.clone())
+        }
+    }
+
+    #[async_std::test]
+    async fn select_response_uses_mail_store_selection() {
+        let _guard = lock_auth_env();
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let selection = MailboxSelection {
+            exists: 3,
+            recent: 2,
+            first_unseen: Some(7),
+            uid_validity: 99,
+            uid_next: 123,
+            flags: vec![MessageFlag::Seen, MessageFlag::Custom("$Forwarded".to_string())],
+            permanent_flags: vec![MessageFlag::Seen],
+        };
+        let store = TestMailStore { selection };
+        let (mut reader, server) = connect_to_server_with_store(store).await;
+
+        read_line(&mut reader).await;
+        authenticate_client(&mut reader, secret).await;
+
+        write_line(&mut reader, "A2 SELECT INBOX\r\n").await;
+        assert_eq!("* 3 EXISTS\r\n", read_line(&mut reader).await);
+        assert_eq!("* 2 RECENT\r\n", read_line(&mut reader).await);
         assert_eq!(
-            "* OK [UNSEEN 12] Message 12 is first unseen\r\n",
+            "* OK [UNSEEN 7] Message 7 is first unseen\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!("* OK [UIDVALIDITY 99] UIDs valid\r\n", read_line(&mut reader).await);
+        assert_eq!(
+            "* OK [UIDNEXT 123] Predicted next UID\r\n",
             read_line(&mut reader).await
         );
         assert_eq!(
-            "* OK [UIDVALIDITY 3857529045] UIDs valid\r\n",
+            "* FLAGS (\\Seen $Forwarded)\r\n",
             read_line(&mut reader).await
         );
         assert_eq!(
-            "* OK [UIDNEXT 4392] Predicted next UID\r\n",
-            read_line(&mut reader).await
-        );
-        assert_eq!(
-            "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n",
-            read_line(&mut reader).await
-        );
-        assert_eq!(
-            "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited\r\n",
+            "* OK [PERMANENTFLAGS (\\Seen)] Limited\r\n",
             read_line(&mut reader).await
         );
         assert_eq!(
