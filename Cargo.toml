@@ -10,6 +10,7 @@ edition = "2018"
 base64 = "0.22.1"
 futures = "0.3.32"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [dependencies.async-std]

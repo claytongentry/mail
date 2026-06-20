@@ -10,9 +10,13 @@ mod store;
 mod xoauth2;
 use connection::{Connection, ConnectionState};
 use parser::{Argument, Command};
-use store::{FixtureMailStore, MailStore, MailboxSelection, MessageFlag};
+use store::{FixtureMailStore, MailStore, MailboxSelection, MessageFlag, SqliteMailStore};
 
 const GREETING: &str = "* OK IMAP4rev1 Service Ready\r\n";
+const MAIL_STORE_ENV: &str = "MAIL_STORE";
+const MAIL_DB_PATH_ENV: &str = "MAIL_DB_PATH";
+const DEFAULT_MAIL_STORE: &str = "fixture";
+const DEFAULT_MAIL_DB_PATH: &str = "/data/mail.sqlite3";
 
 fn tagged(tag: &str, status: &str, message: &str) -> String {
     format!(
@@ -291,7 +295,7 @@ async fn handle_connection(connection: &mut Connection, store: &(impl MailStore 
 #[async_std::main]
 async fn main() -> std::io::Result<()> {
     let bind_addr = env::var("IMAP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:1143".to_string());
-    let store = Arc::new(FixtureMailStore);
+    let store = mail_store_from_env()?;
     println!("IMAPrev1 listening on {}...", bind_addr);
 
     /*
@@ -321,6 +325,29 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+fn mail_store_from_env() -> std::io::Result<Arc<dyn MailStore>> {
+    let store = env::var(MAIL_STORE_ENV).unwrap_or_else(|_| DEFAULT_MAIL_STORE.to_string());
+
+    match store.as_str() {
+        "fixture" => Ok(Arc::new(FixtureMailStore)),
+        "sqlite" => {
+            let path = mail_db_path_from_env();
+            let store = SqliteMailStore::open(&path)
+                .map_err(|err| Error::new(ErrorKind::Other, err.to_string()))?;
+
+            Ok(Arc::new(store))
+        }
+        other => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Unsupported MAIL_STORE '{}'", other),
+        )),
+    }
+}
+
+fn mail_db_path_from_env() -> String {
+    env::var(MAIL_DB_PATH_ENV).unwrap_or_else(|_| DEFAULT_MAIL_DB_PATH.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,10 +361,10 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    static AUTH_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    fn lock_auth_env() -> std::sync::MutexGuard<'static, ()> {
-        AUTH_ENV_LOCK
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -465,6 +492,77 @@ mod tests {
         ))
     }
 
+    fn unique_sqlite_path() -> String {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir()
+            .join(format!("mail-store-{}.sqlite3", id))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn mail_store_defaults_to_fixture() {
+        let _guard = lock_env();
+        unsafe {
+            env::remove_var(MAIL_STORE_ENV);
+            env::remove_var(MAIL_DB_PATH_ENV);
+        }
+
+        let store = mail_store_from_env().unwrap();
+        let selection = store.select_mailbox("INBOX").unwrap();
+
+        assert_eq!(172, selection.exists);
+        assert_eq!(4_392, selection.uid_next);
+    }
+
+    #[test]
+    fn sqlite_mail_store_uses_default_database_path() {
+        let _guard = lock_env();
+        unsafe {
+            env::remove_var(MAIL_DB_PATH_ENV);
+        }
+
+        assert_eq!(DEFAULT_MAIL_DB_PATH, mail_db_path_from_env());
+    }
+
+    #[test]
+    fn invalid_mail_store_is_rejected() {
+        let _guard = lock_env();
+        unsafe {
+            env::set_var(MAIL_STORE_ENV, "postgres");
+            env::remove_var(MAIL_DB_PATH_ENV);
+        }
+
+        let err = match mail_store_from_env() {
+            Ok(_) => panic!("expected invalid mail store to fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(ErrorKind::InvalidInput, err.kind());
+        assert_eq!("Unsupported MAIL_STORE 'postgres'", err.to_string());
+    }
+
+    #[test]
+    fn mail_store_can_use_seeded_sqlite_database() {
+        let _guard = lock_env();
+        let path = unique_sqlite_path();
+        unsafe {
+            env::set_var(MAIL_STORE_ENV, "sqlite");
+            env::set_var(MAIL_DB_PATH_ENV, &path);
+        }
+
+        let store = mail_store_from_env().unwrap();
+        let selection = store.select_mailbox("inbox").unwrap();
+
+        assert_eq!(172, selection.exists);
+        assert_eq!(Some(12), selection.first_unseen);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[async_std::test]
     async fn connection_starts_with_imap_greeting() {
         let (mut reader, server) = connect_to_server().await;
@@ -497,7 +595,7 @@ mod tests {
 
     #[async_std::test]
     async fn authenticate_success_is_tagged_and_crlf_terminated() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -523,7 +621,7 @@ mod tests {
 
     #[async_std::test]
     async fn select_response_uses_crlf_and_tagged_completion() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -541,7 +639,7 @@ mod tests {
 
     #[async_std::test]
     async fn select_inbox_is_case_insensitive() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -558,8 +656,29 @@ mod tests {
     }
 
     #[async_std::test]
+    async fn select_response_can_use_seeded_sqlite_store() {
+        let _guard = lock_env();
+        let secret = "test-secret";
+        unsafe {
+            env::set_var("JWT_SECRET", secret);
+        }
+        let path = unique_sqlite_path();
+        let store = SqliteMailStore::open(&path).unwrap();
+        let (mut reader, server) = connect_to_server_with_store(store).await;
+
+        read_line(&mut reader).await;
+        authenticate_client(&mut reader, secret).await;
+
+        write_line(&mut reader, "A2 SELECT INBOX\r\n").await;
+        assert_fixture_select_response(&mut reader, "A2").await;
+
+        logout(&mut reader, server).await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[async_std::test]
     async fn missing_literal_mailbox_does_not_inject_response_lines() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -597,7 +716,7 @@ mod tests {
 
     #[async_std::test]
     async fn select_response_uses_mail_store_selection() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -647,7 +766,7 @@ mod tests {
 
     #[async_std::test]
     async fn authenticate_without_jwt_secret_returns_tagged_no() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         unsafe {
             env::remove_var("JWT_SECRET");
         }
@@ -671,7 +790,7 @@ mod tests {
 
     #[async_std::test]
     async fn authenticate_rejects_raw_token_initial_response() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         let secret = "test-secret";
         unsafe {
             env::set_var("JWT_SECRET", secret);
@@ -774,7 +893,7 @@ mod tests {
 
     #[async_std::test]
     async fn authenticate_rejects_xoauth2_invalid_bearer_token() {
-        let _guard = lock_auth_env();
+        let _guard = lock_env();
         unsafe {
             env::set_var("JWT_SECRET", "test-secret");
         }
