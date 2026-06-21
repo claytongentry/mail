@@ -143,14 +143,20 @@ fn parse_specific_command(
     name: String,
     args: Vec<Argument>,
 ) -> std::io::Result<Command> {
-    match name.as_str() {
-        "AUTHENTICATE" => parse_authenticate(tag, args),
-        "CAPABILITY" => parse_no_arg(tag, args, |tag| Command::Capability { tag }),
-        "LOGIN" => parse_login(tag, args),
-        "LOGOUT" => parse_no_arg(tag, args, |tag| Command::Logout { tag }),
-        "NOOP" => parse_no_arg(tag, args, |tag| Command::Noop { tag }),
-        "SELECT" => parse_select(tag, args),
-        _ => Ok(Command::Unknown { tag, name, args }),
+    if name.eq_ignore_ascii_case("AUTHENTICATE") {
+        parse_authenticate(tag, args)
+    } else if name.eq_ignore_ascii_case("CAPABILITY") {
+        parse_no_arg(tag, args, |tag| Command::Capability { tag })
+    } else if name.eq_ignore_ascii_case("LOGIN") {
+        parse_login(tag, args)
+    } else if name.eq_ignore_ascii_case("LOGOUT") {
+        parse_no_arg(tag, args, |tag| Command::Logout { tag })
+    } else if name.eq_ignore_ascii_case("NOOP") {
+        parse_no_arg(tag, args, |tag| Command::Noop { tag })
+    } else if name.eq_ignore_ascii_case("SELECT") {
+        parse_select(tag, args)
+    } else {
+        Ok(Command::Unknown { tag, name, args })
     }
 }
 
@@ -403,6 +409,26 @@ mod tests {
         let command = parse_line("A1 NOOP\r\n");
 
         assert_eq!(Command::Noop { tag: "A1".into() }, command);
+    }
+
+    #[test]
+    fn parse_command_names_case_insensitively() {
+        let command = parse_line("A1 capability\r\n");
+
+        assert_eq!(Command::Capability { tag: "A1".into() }, command);
+    }
+
+    #[test]
+    fn parse_mixed_case_command_names_case_insensitively() {
+        let command = parse_line("A1 SeLeCt INBOX\r\n");
+
+        assert_eq!(
+            Command::Select {
+                tag: "A1".into(),
+                mailbox: Argument::Atom("INBOX".into()),
+            },
+            command
+        );
     }
 
     #[test]

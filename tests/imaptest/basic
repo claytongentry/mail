@@ -1,0 +1,21 @@
+state: nonauth
+ignore_extra_untagged: yes
+
+ok capability
+* capability imap4rev1 auth=xoauth2 logindisabled sasl-ir
+
+ok noop
+
+ok authenticate XOAUTH2 $password
+
+ok select INBOX
+* $ exists
+* $ recent
+* ok [unseen $]
+* ok [uidvalidity $]
+* ok [uidnext $]
+* flags (\answered \flagged \deleted \seen \draft)
+* ok [permanentflags (\deleted \seen \*)]
+
+ok logout
+* bye $

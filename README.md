@@ -17,6 +17,7 @@ Common commands:
 just build
 just test
 just start
+just smoke
 ```
 
 `just start` builds the image, runs the server in a container, and publishes it
@@ -25,6 +26,25 @@ Override the local port or JWT secret with environment variables:
 
 ```sh
 MAIL_PORT=2143 JWT_SECRET=local-secret just start
+```
+
+In another terminal, run the scripted imaptest compliance smoke suite against the
+running server:
+
+```sh
+JWT_SECRET=local-secret just smoke
+```
+
+`just smoke` runs the Dovecot `imaptest` binary inside the running
+`mail-dev` container. The target generates an XOAUTH2 initial response from
+the running container's `JWT_SECRET` and runs the scripts copied into
+`/app/tests/imaptest`. Use `IMAPTEST_ARGS` for additional imaptest flags.
+
+By default, `just smoke` reports all scripted failures. To stop at the first
+failure while debugging one issue, run:
+
+```sh
+IMAPTEST_ARGS=error_quit JWT_SECRET=local-secret just smoke
 ```
 
 To use the SQLite mail store, opt in with `MAIL_STORE=sqlite`:

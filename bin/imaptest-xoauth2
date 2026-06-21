@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+set -eu
+
+: "${JWT_SECRET:?JWT_SECRET is required}"
+
+user="${IMAPTEST_USER:-test@example.com}"
+ttl="${IMAPTEST_TOKEN_TTL:-3600}"
+exp=$(($(date +%s) + ttl))
+
+base64_url() {
+    openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+header=$(printf '{"alg":"HS256","typ":"JWT"}' | base64_url)
+payload=$(printf '{"exp":%s}' "$exp" | base64_url)
+signature=$(
+    printf '%s.%s' "$header" "$payload" \
+        | openssl dgst -sha256 -binary -hmac "$JWT_SECRET" \
+        | base64_url
+)
+token="${header}.${payload}.${signature}"
+
+printf 'user=%s\001auth=Bearer %s\001\001' "$user" "$token" | openssl base64 -A
+printf '\n'

@@ -85,7 +85,7 @@ async fn capability(connection: &Connection, id: &str) -> std::io::Result<usize>
     write_messages(
         connection,
         vec![
-            untagged("CAPABILITY IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED"),
+            untagged("CAPABILITY IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED SASL-IR"),
             tagged(id, "OK", "CAPABILITY completed"),
         ],
     )
@@ -589,6 +589,22 @@ mod tests {
             "A1 BAD Command SELECT is not valid in NOTAUTHENTICATED state\r\n",
             read_line(&mut reader).await
         );
+
+        logout(&mut reader, server).await;
+    }
+
+    #[async_std::test]
+    async fn capability_advertises_xoauth2_sasl_ir_and_login_disabled() {
+        let (mut reader, server) = connect_to_server().await;
+
+        read_line(&mut reader).await;
+        write_line(&mut reader, "A1 CAPABILITY\r\n").await;
+
+        assert_eq!(
+            "* CAPABILITY IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED SASL-IR\r\n",
+            read_line(&mut reader).await
+        );
+        assert_eq!("A1 OK CAPABILITY completed\r\n", read_line(&mut reader).await);
 
         logout(&mut reader, server).await;
     }

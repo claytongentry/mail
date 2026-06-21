@@ -1,0 +1,8 @@
+From imaptest@example.com Fri Jun 19 00:00:00 2026
+From: imaptest@example.com
+To: imaptest@example.com
+Subject: imaptest fixture
+Message-ID: <imaptest-fixture@example.com>
+Date: Fri, 19 Jun 2026 00:00:00 +0000
+
+Fixture message for imaptest scripted runs.
