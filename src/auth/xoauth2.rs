@@ -1,4 +1,4 @@
-use crate::parser::Argument;
+use crate::imap::command::Argument;
 use base64::{engine::general_purpose, Engine as _};
 use std::io::{Error, ErrorKind};
 

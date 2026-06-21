@@ -1,4 +1,5 @@
-use crate::parser::{self, Command, CommandPart};
+use super::command::{Command, CommandPart};
+use super::parser;
 use async_std::io::prelude::*;
 use async_std::io::BufReader;
 use async_std::net::TcpStream;
@@ -160,7 +161,7 @@ fn set_state(connection: &mut Connection, state: ConnectionState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{Argument, Command};
+    use super::super::command::{Argument, Command};
     use async_std::net::TcpListener;
     use async_std::task;
 
